@@ -1,0 +1,296 @@
+From 503d6b8d014c4b936f88585bf15ee8445ff8197f Mon Sep 17 00:00:00 2001
+From: Dmitry Skvortsov <lvb.crd@protonmail.com>
+Date: Thu, 27 Jun 2024 17:58:25 +0300
+Subject: [PATCH] Add workaround for ntsync header
+
+---
+ dlls/ntdll/unix/sync.c | 114 +++++++++++++++++++----------------------
+ server/fast_sync.c     | 100 ++++++++++++++++++++----------------
+ 2 files changed, 111 insertions(+), 103 deletions(-)
+
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index c186cd11ef5..053c1553c3a 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -60,8 +60,62 @@
+ #ifdef HAVE_KQUEUE
+ # include <sys/event.h>
+ #endif
++
+ #ifdef HAVE_LINUX_NTSYNC_H
+ # include <linux/ntsync.h>
++#else
++
++#include <linux/types.h>
++
++struct ntsync_sem_args {
++	__u32 sem;
++	__u32 count;
++	__u32 max;
++};
++
++struct ntsync_mutex_args {
++	__u32 mutex;
++	__u32 owner;
++	__u32 count;
++};
++
++struct ntsync_event_args {
++	__u32 event;
++	__u32 manual;
++	__u32 signaled;
++};
++
++#define NTSYNC_WAIT_REALTIME	0x1
++
++struct ntsync_wait_args {
++	__u64 timeout;
++	__u64 objs;
++	__u32 count;
++	__u32 owner;
++	__u32 index;
++	__u32 flags;
++	__u32 alert;
++	__u32 pad;
++};
++
++#define NTSYNC_MAX_WAIT_COUNT 64
++
++#define NTSYNC_IOC_CREATE_SEM		_IOWR('N', 0x80, struct ntsync_sem_args)
++#define NTSYNC_IOC_WAIT_ANY		_IOWR('N', 0x82, struct ntsync_wait_args)
++#define NTSYNC_IOC_WAIT_ALL		_IOWR('N', 0x83, struct ntsync_wait_args)
++#define NTSYNC_IOC_CREATE_MUTEX		_IOWR('N', 0x84, struct ntsync_sem_args)
++#define NTSYNC_IOC_CREATE_EVENT		_IOWR('N', 0x87, struct ntsync_event_args)
++
++#define NTSYNC_IOC_SEM_POST		_IOWR('N', 0x81, __u32)
++#define NTSYNC_IOC_MUTEX_UNLOCK		_IOWR('N', 0x85, struct ntsync_mutex_args)
++#define NTSYNC_IOC_MUTEX_KILL		_IOW ('N', 0x86, __u32)
++#define NTSYNC_IOC_EVENT_SET		_IOR ('N', 0x88, __u32)
++#define NTSYNC_IOC_EVENT_RESET		_IOR ('N', 0x89, __u32)
++#define NTSYNC_IOC_EVENT_PULSE		_IOR ('N', 0x8a, __u32)
++#define NTSYNC_IOC_SEM_READ		_IOR ('N', 0x8b, struct ntsync_sem_args)
++#define NTSYNC_IOC_MUTEX_READ		_IOR ('N', 0x8c, struct ntsync_mutex_args)
++#define NTSYNC_IOC_EVENT_READ		_IOR ('N', 0x8d, struct ntsync_event_args)
++
+ #endif
+ 
+ #include "ntstatus.h"
+@@ -270,7 +324,6 @@ static unsigned int validate_open_object_attributes( const OBJECT_ATTRIBUTES *at
+ }
+ 
+ 
+-#ifdef HAVE_LINUX_NTSYNC_H
+ 
+ static int get_linux_sync_device(void)
+ {
+@@ -1105,65 +1158,6 @@ static NTSTATUS fast_signal_and_wait( HANDLE signal, HANDLE wait,
+     return ret;
+ }
+ 
+-#else
+-
+-void close_fast_sync_obj( HANDLE handle )
+-{
+-}
+-
+-static NTSTATUS fast_release_semaphore( HANDLE handle, ULONG count, ULONG *prev_count )
+-{
+-    return STATUS_NOT_IMPLEMENTED;
+-}
+-
+-static NTSTATUS fast_query_semaphore( HANDLE handle, SEMAPHORE_BASIC_INFORMATION *info )
+-{
+-    return STATUS_NOT_IMPLEMENTED;
+-}
+-
+-static NTSTATUS fast_set_event( HANDLE handle, LONG *prev_state )
+-{
+-    return STATUS_NOT_IMPLEMENTED;
+-}
+-
+-static NTSTATUS fast_reset_event( HANDLE handle, LONG *prev_state )
+-{
+-    return STATUS_NOT_IMPLEMENTED;
+-}
+-
+-static NTSTATUS fast_pulse_event( HANDLE handle, LONG *prev_state )
+-{
+-    return STATUS_NOT_IMPLEMENTED;
+-}
+-
+-static NTSTATUS fast_query_event( HANDLE handle, EVENT_BASIC_INFORMATION *info )
+-{
+-    return STATUS_NOT_IMPLEMENTED;
+-}
+-
+-static NTSTATUS fast_release_mutex( HANDLE handle, LONG *prev_count )
+-{
+-    return STATUS_NOT_IMPLEMENTED;
+-}
+-
+-static NTSTATUS fast_query_mutex( HANDLE handle, MUTANT_BASIC_INFORMATION *info )
+-{
+-    return STATUS_NOT_IMPLEMENTED;
+-}
+-
+-static NTSTATUS fast_wait( DWORD count, const HANDLE *handles, BOOLEAN wait_any,
+-                           BOOLEAN alertable, const LARGE_INTEGER *timeout )
+-{
+-    return STATUS_NOT_IMPLEMENTED;
+-}
+-
+-static NTSTATUS fast_signal_and_wait( HANDLE signal, HANDLE wait,
+-                                      BOOLEAN alertable, const LARGE_INTEGER *timeout )
+-{
+-    return STATUS_NOT_IMPLEMENTED;
+-}
+-
+-#endif
+ 
+ 
+ /******************************************************************************
+diff --git a/server/fast_sync.c b/server/fast_sync.c
+index 0ae646ce48a..b5648c7f78c 100644
+--- a/server/fast_sync.c
++++ b/server/fast_sync.c
+@@ -34,13 +34,68 @@
+ #include "request.h"
+ #include "thread.h"
+ 
+-#ifdef HAVE_LINUX_NTSYNC_H
+ 
+ #include <fcntl.h>
+ #include <sys/ioctl.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+-#include <linux/ntsync.h>
++
++#ifdef HAVE_LINUX_NTSYNC_H
++# include <linux/ntsync.h>
++#else
++
++#include <linux/types.h>
++
++struct ntsync_sem_args {
++	__u32 sem;
++	__u32 count;
++	__u32 max;
++};
++
++struct ntsync_mutex_args {
++	__u32 mutex;
++	__u32 owner;
++	__u32 count;
++};
++
++struct ntsync_event_args {
++	__u32 event;
++	__u32 manual;
++	__u32 signaled;
++};
++
++#define NTSYNC_WAIT_REALTIME	0x1
++
++struct ntsync_wait_args {
++	__u64 timeout;
++	__u64 objs;
++	__u32 count;
++	__u32 owner;
++	__u32 index;
++	__u32 flags;
++	__u32 alert;
++	__u32 pad;
++};
++
++#define NTSYNC_MAX_WAIT_COUNT 64
++
++#define NTSYNC_IOC_CREATE_SEM		_IOWR('N', 0x80, struct ntsync_sem_args)
++#define NTSYNC_IOC_WAIT_ANY		_IOWR('N', 0x82, struct ntsync_wait_args)
++#define NTSYNC_IOC_WAIT_ALL		_IOWR('N', 0x83, struct ntsync_wait_args)
++#define NTSYNC_IOC_CREATE_MUTEX		_IOWR('N', 0x84, struct ntsync_sem_args)
++#define NTSYNC_IOC_CREATE_EVENT		_IOWR('N', 0x87, struct ntsync_event_args)
++
++#define NTSYNC_IOC_SEM_POST		_IOWR('N', 0x81, __u32)
++#define NTSYNC_IOC_MUTEX_UNLOCK		_IOWR('N', 0x85, struct ntsync_mutex_args)
++#define NTSYNC_IOC_MUTEX_KILL		_IOW ('N', 0x86, __u32)
++#define NTSYNC_IOC_EVENT_SET		_IOR ('N', 0x88, __u32)
++#define NTSYNC_IOC_EVENT_RESET		_IOR ('N', 0x89, __u32)
++#define NTSYNC_IOC_EVENT_PULSE		_IOR ('N', 0x8a, __u32)
++#define NTSYNC_IOC_SEM_READ		_IOR ('N', 0x8b, struct ntsync_sem_args)
++#define NTSYNC_IOC_MUTEX_READ		_IOR ('N', 0x8c, struct ntsync_mutex_args)
++#define NTSYNC_IOC_EVENT_READ		_IOR ('N', 0x8d, struct ntsync_event_args)
++
++#endif
+ 
+ struct linux_device
+ {
+@@ -367,43 +422,9 @@ void fast_abandon_mutex( thread_id_t tid, struct fast_sync *fast_sync )
+     ioctl( get_unix_fd( fast_sync->fd ), NTSYNC_IOC_MUTEX_KILL, &tid );
+ }
+ 
+-#else
+-
+-struct fast_sync *fast_create_event( enum fast_sync_type type, int signaled )
+-{
+-    set_error( STATUS_NOT_IMPLEMENTED );
+-    return NULL;
+-}
+-
+-struct fast_sync *fast_create_semaphore( unsigned int count, unsigned int max )
+-{
+-    set_error( STATUS_NOT_IMPLEMENTED );
+-    return NULL;
+-}
+-
+-struct fast_sync *fast_create_mutex( thread_id_t owner, unsigned int count )
+-{
+-    set_error( STATUS_NOT_IMPLEMENTED );
+-    return NULL;
+-}
+-
+-void fast_set_event( struct fast_sync *fast_sync )
+-{
+-}
+-
+-void fast_reset_event( struct fast_sync *obj )
+-{
+-}
+-
+-void fast_abandon_mutex( thread_id_t tid, struct fast_sync *fast_sync )
+-{
+-}
+-
+-#endif
+ 
+ DECL_HANDLER(get_linux_sync_device)
+ {
+-#ifdef HAVE_LINUX_NTSYNC_H
+     struct linux_device *device;
+ 
+     if ((device = get_linux_device()))
+@@ -411,14 +432,10 @@ DECL_HANDLER(get_linux_sync_device)
+         reply->handle = alloc_handle( current->process, device, 0, 0 );
+         release_object( device );
+     }
+-#else
+-    set_error( STATUS_NOT_IMPLEMENTED );
+-#endif
+ }
+ 
+ DECL_HANDLER(get_linux_sync_obj)
+ {
+-#ifdef HAVE_LINUX_NTSYNC_H
+     struct object *obj;
+ 
+     if ((obj = get_handle_obj( current->process, req->handle, 0, NULL )))
+@@ -434,7 +451,4 @@ DECL_HANDLER(get_linux_sync_obj)
+         }
+         release_object( obj );
+     }
+-#else
+-    set_error( STATUS_NOT_IMPLEMENTED );
+-#endif
+ }
+-- 
+2.45.2
+

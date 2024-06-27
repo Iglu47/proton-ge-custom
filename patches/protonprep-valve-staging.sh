@@ -296,6 +296,8 @@
 
     echo "WINE: -PENDING- fastsync patches"
     patch -Np1 < ../patches/wine-hotfixes/pending/ntsync.patch
+    # Once the build environment provides the minimum required kernel version, this workaround can be safely removed.
+    patch -Np1 < ../patches/wine-hotfixes/pending/ntsync-build_env_workaround.patch
 
 ### END WINE PENDING UPSTREAM SECTION ###
 
