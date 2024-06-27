@@ -294,6 +294,9 @@
     echo "WINE: -PENDING- ncrypt: NCryptDecrypt implementation (PSN Login for Ghost of Tsushima)"
     patch -Np1 < ../patches/wine-hotfixes/pending/NCryptDecrypt_implementation.patch
 
+    echo "WINE: -PENDING- fastsync patches"
+    patch -Np1 < ../patches/wine-hotfixes/pending/ntsync.patch
+
 ### END WINE PENDING UPSTREAM SECTION ###
 
 
